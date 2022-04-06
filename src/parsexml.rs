@@ -9,9 +9,11 @@
 
 extern crate nom;
 
-use std::collections::HashSet;
+use std::any::Any;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use nom:: {
+use nom::{
+  Err,
   IResult,
   branch::alt,
   character::complete::{char, multispace0, multispace1, none_of,},
@@ -21,6 +23,7 @@ use nom:: {
   bytes::complete::{tag, take_until, take_while_m_n},
   sequence::delimited,
 };
+use nom::error::make_error;
 use crate::qname::*;
 use crate::item::*;
 use crate::parsecommon::*;
@@ -40,7 +43,8 @@ pub struct XMLDocument {
   pub prologue: Vec<XMLNode>,
   pub content: Vec<XMLNode>,
   pub epilogue: Vec<XMLNode>,
-  pub xmldecl: Option<XMLdecl>
+  pub xmldecl: Option<XMLdecl>,
+  pub dtd: Option<DocTypeDecl>
 }
 
 #[derive(Clone, PartialEq)]
@@ -59,8 +63,19 @@ pub struct XMLdecl {
     standalone: Option<String>
 }
 
+#[derive(PartialEq)]
+pub struct DocTypeDecl {
+    name: String,
+    elements: HashMap<&'static str, String>,
+    attrlists: HashMap<&'static str, String>,
+    publicid: Option<String>,
+    systemid: Option<String>,
+    dtdgenentities: HashMap<&'static str, String>,
+    dtdparamentities: HashMap<&'static str, String>,
+}
+
 // document ::= ( prolog element misc*)
-fn document(input: &str) -> IResult<&str, XMLDocument> {
+fn document<'parser>(input: &str) -> IResult<&str, XMLDocument> {
   map (
     tuple((
       opt(prolog),
@@ -68,13 +83,14 @@ fn document(input: &str) -> IResult<&str, XMLDocument> {
       opt(misc),
     )),
     |(p, e, m)| {
-      let pr = p.unwrap_or((None, vec![]));
+      let pr = p.unwrap_or((None, None));
 
       XMLDocument {
 	    content: vec![e],
 	    epilogue: m.unwrap_or(vec![]),
         xmldecl: pr.0,
-        prologue: pr.1
+        prologue: vec![],
+        dtd: pr.1
       }
     }
   )
@@ -82,13 +98,13 @@ fn document(input: &str) -> IResult<&str, XMLDocument> {
 }
 
 // prolog ::= XMLDecl misc* (doctypedecl Misc*)?
-fn prolog(input: &str) -> IResult<&str, (Option<XMLdecl>, Vec<XMLNode>)> {
+fn prolog(input: &str) -> IResult<&str, (Option<XMLdecl>, Option<DocTypeDecl>)> {
     map(
         tuple((
             opt(xmldecl),
             opt(doctypedecl)
             )),
-        |(x, dtd)| (x, vec![])
+        |(x, dtd)| (x, dtd)
     )(input)
 }
 
@@ -141,16 +157,234 @@ fn xmldecl(input: &str) -> IResult<&str, XMLdecl> {
     )(input)
 }
 
-fn doctypedecl(input: &str) -> IResult<&str, Vec<XMLNode>> {
+fn doctypedecl<'parser>(input: &str) -> IResult<&str, DocTypeDecl> {
     map(
-        tag("not yet implemented"),
-        |_| {
-            vec![]
+        tuple((
+            tag("<!DOCTYPE"),
+            multispace0,
+            name,
+            multispace0,
+            opt(externalid),
+            multispace0,
+            opt(
+                delimited(
+                    tag("["),
+                    intsubset,
+                    tag("]")
+                )
+            ),
+            tag(">")
+            )),        |(_,_,n,_,id,_,iss,_)|
+            {
+            let i = iss.unwrap_or((Default::default(), Default::default(), Default::default(), Default::default()));
+            println!("E-{:?}",i.0);
+            println!("A-{:?}",i.1);
+            println!("G-{:?}",i.2);
+            println!("P-{:?}",i.3);
+            DocTypeDecl {
+                name: "".to_string(),
+                elements: HashMap::new(),
+                attrlists: HashMap::new(),
+                publicid: None,
+                systemid: None,
+                dtdgenentities: HashMap::new(),
+                dtdparamentities: HashMap::new()
+            }
         }
-    )
-        (input)
+    )(input)
+}
+fn externalid(input: &str) -> IResult<&str, (&str, Option<&str>)> {
+    alt((
+        map(
+            tuple((
+                tag("SYSTEM"),
+                multispace0,
+                alt((
+                    delimited(tag("'"),take_until("'"),tag("'")),
+                    delimited(tag("\""),take_until("\""),tag("\""))
+                )) //SystemLiteral
+            )),
+            |(_,_,sid)| (sid, None)
+        ),
+        map(
+            tuple((
+                tag("PUBLIC"),
+                multispace0,
+                alt((
+                    delimited(tag("'"),take_until("'"),tag("'")),
+                    delimited(tag("\""),take_until("\""),tag("\""))
+                )), //PubidLiteral TODO validate chars here (PubidChar from spec).
+                multispace1,
+                alt((
+                    delimited(tag("'"),take_until("'"),tag("'")),
+                    delimited(tag("\""),take_until("\""),tag("\""))
+                )) //SystemLiteral
+            )),
+            |(_,_,pid,_,sid)| (sid, Some(pid))
+        )
+    ))(input)
 }
 
+fn intsubset(input: &str) -> IResult<String, (HashMap<&str, &str>, HashMap<&str, &str>, HashMap<&str, &str>, HashMap<&str, &str>)> {
+    let mut elements = HashMap::new();
+    let mut attrs = HashMap::new();
+    let mut genentities = HashMap::new();
+    let mut paramentities = HashMap::new();
+    let mut i = input;
+
+    /*
+        Very messy for now, but it will be cleaned up.
+        We manually loop instead of using many0 because any entities declared we need to use as we go.
+     */
+        loop {
+            match elementdecl(i) {
+                Ok((newinput, (name, content))) => {
+                    elements.insert(name, content);
+                    i = newinput;
+                },
+                Err(Err::Error(_)) => {
+                    match attlistdecl(i) {
+                        Ok((newinput, (name, attdef))) => {
+                            attrs.insert(name, attdef);
+                            i = newinput;
+                        },
+                        Err(Err::Error(_)) => {
+                            match gedecl(i) {
+                                Ok((newinput, (name, gcon))) => {
+                                    genentities.insert(name, gcon);
+                                    i = newinput;
+                                },
+                                Err(Err::Error(_)) =>
+                                    {
+                                        match pedecl(i) {
+                                            Ok((newinput, (name, pcon))) => {
+                                                paramentities.insert(name, pcon);
+                                                i = newinput;
+                                            },
+                                            Err(Err::Error(_)) =>
+                                                {
+                                                    match pereference(i) {
+                                                        Ok((newinput, pe)) => {
+                                                            match paramentities.get(pe) {
+                                                                None => make_error(i, nom::error::ErrorKind::Tag),
+                                                                Some(P) => {
+                                                                    //println!("PAA={}", P);
+                                                                    //let mut Q = (*P).clone().to_string();
+                                                                    //println!("Q={}", Q);
+                                                                    //println!("NI={}", newinput);
+                                                                    i = &*((*P).clone().to_string() + newinput);
+                                                                    //i = newinput;
+                                                                }
+                                                            }
+                                                        },
+                                                        Err(Err::Error(_)) =>
+                                                            {
+                                                                return Ok((i, (elements, attrs, genentities, paramentities)));
+                                                            },
+                                                        Err(e) => return Err(e),
+                                                    }
+                                                },
+                                            Err(e) => return Err(e),
+                                        }
+                                    },
+                                Err(e) => return Err(e),
+                            }
+                        },
+                        Err(e) => return Err(e),
+                    }
+                },
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+fn elementdecl(input: &str) -> IResult<&str, (&str, &str)> {
+    map (
+        tuple((
+            tag("<!ELEMENT"),
+            multispace1,
+            name,
+            multispace1,
+            take_until(">"), //contentspec - TODO Build out.
+            multispace0,
+            tag(">")
+        )),
+        | (_,_,n,_,c,_,_)| (n, c)
+    )(input)
+}
+
+fn attlistdecl(input: &str) -> IResult<&str, (&str, &str)> {
+    map(
+        tuple((
+            tag("<!ATTLIST"),
+            multispace1,
+            name,
+            multispace1,
+            take_until(">"), //AttDef - TODO Build out.
+            multispace0,
+            tag(">")
+        )),
+        | (_,_,n,_,s,_,_)| {
+            (n, s)
+        }
+    )(input)
+}
+
+fn gedecl(input: &str) -> IResult<&str, (&str, &str)> {
+    //TODO build out system and public IDs
+    // <!ENTITY a "TEST">
+    map(
+        tuple((
+            tag("<!ENTITY"),
+            multispace1,
+            name,
+            multispace1,
+            alt((
+                delimited(tag("'"),take_until("'"),tag("'")),
+                delimited(tag("\""),take_until("\""),tag("\""))
+            )),
+            multispace0,
+            tag(">")
+        )),
+        | (_,_,n,_,v,_,_)| {
+            println!("N-{:?}",v);
+            println!("V-{:?}",v);
+            (n, v)
+        }
+    )(input)
+}
+
+fn pedecl(input: &str) -> IResult<&str, (&str, &str)> {
+    //TODO build out system and public IDs
+    map(
+        tuple((
+            tag("<!ENTITY"),
+            multispace1,
+            tag("%"),
+            multispace1,
+            name,
+            multispace1,
+            alt((
+                delimited(tag("'"),take_until("'"),tag("'")),
+                delimited(tag("\""),take_until("\""),tag("\""))
+            )),
+            multispace0,
+            tag(">")
+        )),
+        | (_,_,_,_,n,_,v,_,_)| {
+            println!("PV-{:?}",v);
+            (n, v)
+        }
+    )(input)
+}
+
+fn pereference(input: &str) -> IResult<&str, &str> {
+    delimited(
+        tag("%"),
+        take_until(";"),
+        tag(";")
+    )(input)
+}
 
 // Element ::= EmptyElemTag | STag content ETag
 fn element(input: &str) -> IResult<&str, XMLNode> {
@@ -689,4 +923,30 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn xmldtd() {
+        let doc = r#"<!DOCTYPE doc [<!ELEMENT doc (#PCDATA)><!ELEMENT doctwo (#PCDATA)><!ELEMENT docthree (#PCDATA)><!ATTLIST name id CDATA #REQUIRED><!ATTLIST nametwo id CDATA #REQUIRED><!ENTITY a "TEST"><!ENTITY % a "TEST2">]><doc/>"#;
+        let result = parse(doc).expect("failed to parse XML \"<?xml version=\"1.0\" encoding=\"UTF-8\"?><doc/>\"");
+        assert_eq!(result.prologue.len(), 0);
+        assert_eq!(result.epilogue.len(), 0);
+        assert_eq!(result.content.len(), 1);
+        match result.dtd {
+            None => {println!("No DTD found")}
+            Some(
+                DocTypeDecl{
+                    name,
+                    elements,
+                    attrlists,
+                    publicid,
+                    systemid,
+                    dtdgenentities,
+                    dtdparamentities
+                }
+            ) => {
+                println!("{:?}", name)
+            }
+        }
+    }
+
 }

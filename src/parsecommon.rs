@@ -26,7 +26,7 @@ pub fn name(input: &str) -> IResult<&str, &str> {
   recognize (
     pair (
       namestartchar,
-      take_while1(is_namechar),
+      take_while(is_namechar),
     )
   )
   (input)
